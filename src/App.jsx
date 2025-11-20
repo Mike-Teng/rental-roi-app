@@ -7,9 +7,9 @@ export default function App() {
   // --- 1. 輸入資料狀態 ---
   const [inputs, setInputs] = useState({
     // 成本與收入
-    estimatedUpfrontCost: 2000000, // 前期預估成本
-    actualUpfrontCost: 2200000,    // 實際投入前期成本
-    monthlyMisc: 5000,             // 預估每月雜支
+    estimatedUpfrontCost: 1000000, // 前期預估成本
+    actualUpfrontCost: 1000000,    // 實際投入前期成本
+    monthlyMisc: 2000,             // 預估每月雜支
     
     // 投資與分潤拆分
     fundInjectionRatio: 80,        // 資金方-投入比例 (%)
@@ -19,13 +19,13 @@ export default function App() {
     manpowerProfitRatio: 70,       // 人力方-分潤比例 (%)
 
     // 合約
-    contractMonths: 60,            // 合約總月數 (5年)
-    phase1Months: 24,              // 前段合約月數 (2年)
+    contractMonths: 120,            // 合約總月數 (5年)
+    phase1Months: 72,              // 前段合約月數 (2年)
     
     // 收支
     rentPhase1: 30000,             // 前段每月房東租金
-    rentPhase2: 35000,             // 後段每月房東租金
-    monthlyIncome: 80000,          // 每月房客租金收入
+    rentPhase2: 33000,             // 後段每月房東租金
+    monthlyIncome: 60000,          // 每月房客租金收入
     
     // 時間
     startDate: '2025-12',          // 數值起始年月
