@@ -1,15 +1,53 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Calculator, PieChart, List, Save, Calendar, DollarSign, Users, TrendingUp, Briefcase, Wallet, Percent } from 'lucide-react';
 
+// --- UI 元件 (移到 App 外面以解決輸入焦點跳掉的問題) ---
+const InputGroup = ({ label, children }) => (
+  <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3">
+    <div className="text-xs font-bold text-gray-400 mb-2 uppercase tracking-wider">{label}</div>
+    <div className="space-y-3">{children}</div>
+  </div>
+);
+
+const InputRow = ({ label, value, onChange, type = "number", suffix = "" }) => (
+  <div className="flex justify-between items-center border-b border-gray-50 last:border-0 pb-2 last:pb-0">
+    <label className="text-sm font-medium text-gray-700">{label}</label>
+    <div className="flex items-center">
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="text-right font-semibold text-gray-900 outline-none bg-transparent w-32 placeholder-gray-300"
+        placeholder="0"
+      />
+      {suffix && <span className="ml-2 text-sm text-gray-500 w-4">{suffix}</span>}
+    </div>
+  </div>
+);
+
+const ResultCard = ({ title, value, subValue, icon: Icon, colorClass = "bg-blue-600" }) => (
+  <div className={`${colorClass} text-white p-5 rounded-2xl shadow-lg mb-4`}>
+    <div className="flex items-center gap-2 mb-2 opacity-90">
+      {Icon && <Icon size={18} />}
+      <span className="text-sm font-medium">{title}</span>
+    </div>
+    <div className="text-4xl font-bold tracking-tight mb-1">{value}</div>
+    <div className="text-sm opacity-75 border-t border-white/20 pt-2 mt-2">{subValue}</div>
+  </div>
+);
+
+const formatMoney = (num) => new Intl.NumberFormat('zh-TW').format(Math.round(num));
+
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('input');
 
   // --- 1. 輸入資料狀態 ---
   const [inputs, setInputs] = useState({
     // 成本與收入
-    estimatedUpfrontCost: 1000000, // 前期預估成本
-    actualUpfrontCost: 1000000,    // 實際投入前期成本
-    monthlyMisc: 2000,             // 預估每月雜支
+    estimatedUpfrontCost: 2000000, // 前期預估成本
+    actualUpfrontCost: 2200000,    // 實際投入前期成本
+    monthlyMisc: 5000,             // 預估每月雜支
     
     // 投資與分潤拆分
     fundInjectionRatio: 80,        // 資金方-投入比例 (%)
@@ -19,13 +57,13 @@ export default function App() {
     manpowerProfitRatio: 70,       // 人力方-分潤比例 (%)
 
     // 合約
-    contractMonths: 120,            // 合約總月數 (5年)
-    phase1Months: 72,              // 前段合約月數 (2年)
+    contractMonths: 60,            // 合約總月數 (5年)
+    phase1Months: 24,              // 前段合約月數 (2年)
     
     // 收支
     rentPhase1: 30000,             // 前段每月房東租金
-    rentPhase2: 33000,             // 後段每月房東租金
-    monthlyIncome: 60000,          // 每月房客租金收入
+    rentPhase2: 35000,             // 後段每月房東租金
+    monthlyIncome: 80000,          // 每月房客租金收入
     
     // 時間
     startDate: '2025-12',          // 數值起始年月
@@ -142,11 +180,11 @@ export default function App() {
       
       investorPrincipal,
       investorProfitShare,
-      investorAnnualizedROI, // 新增
+      investorAnnualizedROI,
       
       operatorPrincipal,
       operatorProfitShare,
-      operatorAnnualizedROI, // 新增
+      operatorAnnualizedROI,
       
       projectRealNetProfit, 
 
@@ -158,43 +196,7 @@ export default function App() {
     };
   }, [inputs]);
 
-  // --- 3. UI 元件 ---
-  const InputGroup = ({ label, children }) => (
-    <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3">
-      <div className="text-xs font-bold text-gray-400 mb-2 uppercase tracking-wider">{label}</div>
-      <div className="space-y-3">{children}</div>
-    </div>
-  );
-
-  const InputRow = ({ label, value, onChange, type = "number", suffix = "" }) => (
-    <div className="flex justify-between items-center border-b border-gray-50 last:border-0 pb-2 last:pb-0">
-      <label className="text-sm font-medium text-gray-700">{label}</label>
-      <div className="flex items-center">
-        <input
-          type={type}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="text-right font-semibold text-gray-900 outline-none bg-transparent w-32 placeholder-gray-300"
-          placeholder="0"
-        />
-        {suffix && <span className="ml-2 text-sm text-gray-500 w-4">{suffix}</span>}
-      </div>
-    </div>
-  );
-
-  const ResultCard = ({ title, value, subValue, icon: Icon, colorClass = "bg-blue-600" }) => (
-    <div className={`${colorClass} text-white p-5 rounded-2xl shadow-lg mb-4`}>
-      <div className="flex items-center gap-2 mb-2 opacity-90">
-        {Icon && <Icon size={18} />}
-        <span className="text-sm font-medium">{title}</span>
-      </div>
-      <div className="text-4xl font-bold tracking-tight mb-1">{value}</div>
-      <div className="text-sm opacity-75 border-t border-white/20 pt-2 mt-2">{subValue}</div>
-    </div>
-  );
-
-  const formatMoney = (num) => new Intl.NumberFormat('zh-TW').format(Math.round(num));
-
+  // 連動處理：輸入 A 自動計算 B = 100 - A
   const handleRatioChange = (keyA, keyB, value) => {
     const val = parseFloat(value);
     if (isNaN(val)) return;
@@ -278,7 +280,7 @@ export default function App() {
           {/* TAB 2: 報表結果 */}
           {activeTab === 'report' && (
             <div className="animate-fadeIn space-y-4">
-              {/* 回本卡片 (修正顯示：大字月數，小字日期) */}
+              {/* 回本卡片 (大字月數，小字日期) */}
               <ResultCard 
                 title="預估回本時間" 
                 value={typeof results.breakEvenMonths === 'number' ? `${results.breakEvenMonths} 個月` : results.breakEvenMonths} 
@@ -296,7 +298,7 @@ export default function App() {
                 <div className="text-[10px] text-gray-400 mt-1">總營收 - 總支出 - 初始成本</div>
               </div>
 
-              {/* 資金方卡片 (新增年化報酬，移除總回收) */}
+              {/* 資金方卡片 */}
               <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-200 relative overflow-hidden">
                 <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2 text-gray-900 font-bold">
