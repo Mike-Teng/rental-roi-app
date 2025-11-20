@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #f3f4f6; /* 讓背景稍微灰一點，模擬手機 App 質感 */
+  overscroll-behavior-y: none; /* 防止手機下拉重新整理 */
+}
