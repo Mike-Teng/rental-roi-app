@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, Percent, History, Trash2, ChevronRight, UploadCloud, X, LogIn, LogOut, User, RefreshCcw } from 'lucide-react';
+import { Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, Percent, History, Trash2, ChevronRight, UploadCloud, X, LogIn, LogOut, User, RefreshCcw, DollarSign } from 'lucide-react';
 
 // --- Firebase 模組導入 ---
 import { initializeApp } from "firebase/app";
 import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "firebase/auth";
 import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp } from "firebase/firestore";
 
-// --- ⚠️ Firebase 設定 (請保持您原本填好的金鑰) ---
+// --- ⚠️ Firebase 設定 ---
 const firebaseConfig = {
   apiKey: "AIzaSyC-4eqOa_YC-SdZZrjfEtKaUNtof5cfE9U",
   authDomain: "rental-roi-app.firebaseapp.com",
@@ -34,6 +34,41 @@ try {
 } catch (e) {
   console.error("Firebase 初始化失敗:", e);
 }
+
+// --- 財務算法 Helper: IRR 計算 (使用牛頓法逼近) ---
+const calculateIRR = (values, guess = 0.1) => {
+  // values: [initialCost (negative), flow1, flow2, ...]
+  const maxIter = 1000;
+  const precision = 0.00001;
+  let rate = guess;
+
+  for (let i = 0; i < maxIter; i++) {
+    let npv = 0;
+    let d_npv = 0; // NPV 的導數 (Derivative)
+
+    for (let t = 0; t < values.length; t++) {
+      npv += values[t] / Math.pow(1 + rate, t);
+      d_npv -= (t * values[t]) / Math.pow(1 + rate, t + 1);
+    }
+
+    const newRate = rate - npv / d_npv;
+    if (Math.abs(newRate - rate) < precision) {
+      return newRate;
+    }
+    rate = newRate;
+  }
+  return null; // 無法收斂
+};
+
+// --- 財務算法 Helper: NPV 計算 ---
+const calculateNPV = (rate, initialCost, cashFlows) => {
+  // rate: 月利率
+  let npv = -initialCost;
+  for (let t = 0; t < cashFlows.length; t++) {
+    npv += cashFlows[t] / Math.pow(1 + rate, t + 1);
+  }
+  return npv;
+};
 
 // --- UI 元件 ---
 
@@ -92,18 +127,24 @@ export default function App() {
   const [historyRecords, setHistoryRecords] = useState([]);
   const [isSaving, setIsSaving] = useState(false);
   const [notification, setNotification] = useState({ message: '', type: 'success' });
-  
   const [user, setUser] = useState(null);
-
-  // 新增：儲存每個月的手動覆寫值
-  // 結構： { "0": { income: 85000 }, "5": { expense: 40000 } }  (Key 是月份索引)
   const [monthlyOverrides, setMonthlyOverrides] = useState({});
 
   const [inputs, setInputs] = useState({
     projectName: '我的租賃專案',
     estimatedUpfrontCost: 2000000,
     actualUpfrontCost: 2200000,
-    monthlyMisc: 5000,
+    
+    // --- 詳細費用設定 (取代原本的 monthlyMisc) ---
+    expenseManagement: 2000,  // 管理費
+    expenseMaintenance: 1000, // 修繕準備金
+    expenseTax: 0,            // 稅務攤提
+    expenseInsurance: 0,      // 保險費
+    expenseOther: 2000,       // 其他雜支 (舊資料會對應到這裡)
+    
+    // --- 進階財測設定 ---
+    discountRate: 3,          // 折現率 (%) - 用於計算 NPV
+
     fundInjectionRatio: 80,
     manpowerInjectionRatio: 20,
     fundProfitRatio: 30,
@@ -121,20 +162,17 @@ export default function App() {
     setTimeout(() => setNotification({ message: '', type: 'success' }), 3000);
   };
 
-  // --- 1. 監聽登入狀態 ---
+  // 1. 監聽登入
   useEffect(() => {
     if (!auth) return;
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-    });
-    return () => unsubscribe();
+    return onAuthStateChanged(auth, (currentUser) => setUser(currentUser));
   }, []);
 
   const handleLogin = async () => {
     if (!auth) { showNotify("Auth 未初始化", "error"); return; }
     const provider = new GoogleAuthProvider();
     try { await signInWithPopup(auth, provider); showNotify("登入成功！"); }
-    catch (error) { console.error("Login Failed:", error); showNotify("登入失敗", "error"); }
+    catch (error) { showNotify("登入失敗", "error"); }
   };
 
   const handleLogout = async () => {
@@ -142,7 +180,7 @@ export default function App() {
     catch (error) { showNotify("登出失敗", "error"); }
   };
 
-  // --- 2. Firebase 資料庫監聽 ---
+  // 2. Firebase 監聽
   useEffect(() => {
     if (!db || !user) return;
     try {
@@ -155,15 +193,14 @@ export default function App() {
     } catch (err) { console.error("Firebase Query 錯誤:", err); }
   }, [user]);
 
-  // 儲存到雲端 (新增 monthlyOverrides)
+  // 儲存
   const handleSaveToCloud = async () => {
-    if (!db) { showNotify("未連接資料庫", "error"); return; }
-    if (!user) { showNotify("請先登入", "error"); return; }
+    if (!db || !user) { showNotify("請先登入並連接資料庫", "error"); return; }
     setIsSaving(true);
     try {
       await addDoc(collection(db, "projects"), {
         ...inputs,
-        monthlyOverrides: JSON.stringify(monthlyOverrides), // 將覆寫資料轉字串儲存
+        monthlyOverrides: JSON.stringify(monthlyOverrides),
         userId: user.uid,
         authorName: user.displayName,
         createdAt: serverTimestamp(),
@@ -171,7 +208,7 @@ export default function App() {
       });
       showNotify("儲存成功！");
       setActiveTab('history');
-    } catch (error) { console.error("Error adding document: ", error); showNotify("儲存失敗", "error"); }
+    } catch (error) { showNotify("儲存失敗", "error"); }
     setIsSaving(false);
   };
 
@@ -185,62 +222,68 @@ export default function App() {
   const handleLoadRecord = (record) => {
     // eslint-disable-next-line no-unused-vars
     const { id, createdAt, summary, userId, authorName, monthlyOverrides: savedOverrides, ...recordInputs } = record;
+    
+    // --- 舊資料相容性處理 ---
+    // 如果舊資料有 monthlyMisc 但沒有新的詳細費用，將其歸入 expenseOther
+    if (recordInputs.monthlyMisc && recordInputs.expenseOther === undefined) {
+      recordInputs.expenseOther = recordInputs.monthlyMisc;
+      recordInputs.expenseManagement = 0;
+      recordInputs.expenseMaintenance = 0;
+      recordInputs.expenseTax = 0;
+      recordInputs.expenseInsurance = 0;
+    }
+
     setInputs(prev => ({ ...prev, ...recordInputs }));
     
-    // 載入覆寫資料
     if (savedOverrides) {
-      try {
-        setMonthlyOverrides(JSON.parse(savedOverrides));
-      } catch (e) {
-        setMonthlyOverrides({});
-      }
-    } else {
-      setMonthlyOverrides({});
-    }
+      try { setMonthlyOverrides(JSON.parse(savedOverrides)); } catch (e) { setMonthlyOverrides({}); }
+    } else { setMonthlyOverrides({}); }
     
     showNotify("已載入專案資料");
     setActiveTab('report');
   };
 
-  // --- 手動修改表格的處理函式 ---
   const handleOverrideChange = (index, field, val) => {
     const numVal = val === '' ? null : parseFloat(val);
     setMonthlyOverrides(prev => {
       const currentMonth = prev[index] || {};
-      // 如果值是 null (清空)，則移除該 key
       const newMonthData = { ...currentMonth, [field]: numVal };
-      
-      // 如果該月沒有任何覆寫了，就從 state 移除該月 key，保持乾淨
       if (newMonthData.income == null && newMonthData.expense == null) {
         const { [index]: deleted, ...rest } = prev;
         return rest;
       }
-      
       return { ...prev, [index]: newMonthData };
     });
   };
 
-  // 清除所有手動修改
   const handleResetOverrides = () => {
-    if (window.confirm("確定要清除所有手動修改的月份數據，恢復為預設公式計算嗎？")) {
+    if (window.confirm("確定要清除所有手動修改，恢復預設值嗎？")) {
       setMonthlyOverrides({});
       showNotify("已恢復預設值");
     }
   };
 
-  // --- 3. 計算核心邏輯 ---
+  // --- 3. 計算核心邏輯 (含 IRR & NPV) ---
   const results = useMemo(() => {
     const start = new Date(inputs.startDate + '-01');
     const totalMonths = parseInt(inputs.contractMonths) || 0;
     const p1Months = parseInt(inputs.phase1Months) || 0;
     const actualCost = parseInt(inputs.actualUpfrontCost) || 0;
+    const discountRateAnnual = (parseFloat(inputs.discountRate) || 0) / 100;
     
     const fundInjPct = (parseFloat(inputs.fundInjectionRatio) || 0) / 100;
     const manInjPct = (parseFloat(inputs.manpowerInjectionRatio) || 0) / 100;
     const fundProfPct = (parseFloat(inputs.fundProfitRatio) || 0) / 100;
     const manProfPct = (parseFloat(inputs.manpowerProfitRatio) || 0) / 100;
 
-    const misc = parseInt(inputs.monthlyMisc) || 0;
+    // 計算總基本費用 (Base Monthly Expenses)
+    const baseExpense = 
+      (parseInt(inputs.expenseManagement) || 0) +
+      (parseInt(inputs.expenseMaintenance) || 0) +
+      (parseInt(inputs.expenseTax) || 0) +
+      (parseInt(inputs.expenseInsurance) || 0) +
+      (parseInt(inputs.expenseOther) || 0);
+
     const rent1 = parseInt(inputs.rentPhase1) || 0;
     const rent2 = parseInt(inputs.rentPhase2) || 0;
     const baseIncome = parseInt(inputs.monthlyIncome) || 0;
@@ -252,6 +295,7 @@ export default function App() {
     let totalExpenses = 0;
     
     const monthlyData = [];
+    const netCashFlowsForIRR = [-actualCost]; // T0 是負的初始成本
 
     for (let i = 0; i < totalMonths; i++) {
       const currentMonthDate = new Date(start);
@@ -259,23 +303,23 @@ export default function App() {
       const dateStr = `${currentMonthDate.getFullYear()}/${String(currentMonthDate.getMonth() + 1).padStart(2, '0')}`;
 
       // 1. 計算預設值
-      const defaultRent = i < p1Months ? rent1 : rent2;
-      const defaultExpense = defaultRent + misc;
+      const currentRent = i < p1Months ? rent1 : rent2;
+      const defaultExpense = currentRent + baseExpense;
       
       let defaultIncome = baseIncome;
       if (i >= 12) defaultIncome = Math.round(baseIncome * 0.95);
 
-      // 2. 檢查是否有手動覆寫 (Override)
+      // 2. 檢查覆寫
       const override = monthlyOverrides[i] || {};
-      
-      // 使用覆寫值，若無則使用預設值
       const currentIncome = override.income != null ? override.income : defaultIncome;
       const currentExpense = override.expense != null ? override.expense : defaultExpense;
       
       const netCashFlow = currentIncome - currentExpense;
+      
       cumulativeCashFlow += netCashFlow;
       totalRevenue += currentIncome;
       totalExpenses += currentExpense;
+      netCashFlowsForIRR.push(netCashFlow); // 收集每個月淨流供 IRR 計算
 
       if (breakEvenMonthIndex === -1 && cumulativeCashFlow >= actualCost) {
         breakEvenMonthIndex = i + 1;
@@ -289,17 +333,24 @@ export default function App() {
         expense: currentExpense, 
         netProfit: netCashFlow, 
         cumulative: cumulativeCashFlow,
-        isOverridden: override.income != null || override.expense != null // 標記是否有修改
+        isOverridden: override.income != null || override.expense != null
       });
     }
 
+    // --- 進階指標計算 ---
+    // 1. NPV
+    const monthlyDiscountRate = discountRateAnnual / 12;
+    const npv = calculateNPV(monthlyDiscountRate, actualCost, netCashFlowsForIRR.slice(1)); // slice(1) 移除 T0, 因為 T0 在公式是單獨減項
+
+    // 2. IRR (月 IRR -> 年 IRR)
+    const monthlyIRR = calculateIRR(netCashFlowsForIRR);
+    const annualIRR = monthlyIRR ? (Math.pow(1 + monthlyIRR, 12) - 1) * 100 : 0;
+
+    // --- 基礎指標計算 ---
     const monthlyAmortization = totalMonths > 0 ? Math.round(actualCost / totalMonths) : 0;
-    // 平均成本改為：總支出 / 月數 (這樣才能反映手動修改後的真實平均)
     const monthlyTotalCostWithAmort = totalMonths > 0 ? Math.round((totalExpenses / totalMonths) + monthlyAmortization) : 0;
-    const avgMonthlyNetIncome = totalMonths > 0 ? Math.round((totalRevenue - totalExpenses - actualCost) / totalMonths) : 0; // 純收益 = (總營收 - 總支出 - 本金) / 月數
+    const avgMonthlyNetIncome = totalMonths > 0 ? Math.round((totalRevenue - totalExpenses - actualCost) / totalMonths) : 0; 
     
-    // 修正邏輯：總預估利潤基數 = 總淨現金流 - 初始成本 (這才是真正的總獲利池)
-    // 不使用平均值去推算，因為手動修改後每個月不一樣
     const projectRealNetProfit = cumulativeCashFlow - actualCost;
 
     const investorProfitShare = projectRealNetProfit > 0 ? projectRealNetProfit * fundProfPct : 0;
@@ -324,8 +375,11 @@ export default function App() {
       operatorPrincipal, operatorProfitShare, operatorAnnualizedROI,
       projectRealNetProfit, monthlyAmortization, monthlyTotalCostWithAmort,
       avgMonthlyNetIncome, costRatio, monthlyData,
+      // 新指標
+      npv: Math.round(npv),
+      irr: annualIRR.toFixed(2)
     };
-  }, [inputs, monthlyOverrides]); // 依賴加入 monthlyOverrides
+  }, [inputs, monthlyOverrides]);
 
   const handleRatioChange = (keyA, keyB, value) => {
     const val = parseFloat(value);
@@ -345,7 +399,6 @@ export default function App() {
             <h1 className="text-2xl font-bold text-gray-900">租賃專案試算</h1>
             <p className="text-xs text-gray-500 mt-1">Project ROI Calculator</p>
           </div>
-          
           <div className="flex items-center gap-2">
             {user ? (
               <>
@@ -374,20 +427,36 @@ export default function App() {
             <div className="animate-fadeIn">
                <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3">
                 <label className="text-xs font-bold text-gray-400 mb-2 uppercase tracking-wider block">專案名稱</label>
-                <input 
-                  type="text" 
-                  value={inputs.projectName}
-                  onChange={(e) => setInputs({...inputs, projectName: e.target.value})}
-                  className="w-full text-lg font-bold text-gray-800 border-b border-gray-200 pb-1 outline-none focus:border-blue-500 transition-colors bg-transparent"
-                  placeholder="請輸入專案名稱..."
-                />
+                <input type="text" value={inputs.projectName} onChange={(e) => setInputs({...inputs, projectName: e.target.value})} className="w-full text-lg font-bold text-gray-800 border-b border-gray-200 pb-1 outline-none focus:border-blue-500 transition-colors bg-transparent" placeholder="請輸入專案名稱..." />
               </div>
 
               <InputGroup label="起始與成本">
                 <InputRow label="數值起始年月" type="month" value={inputs.startDate} onChange={v => setInputs({...inputs, startDate: v})} />
                 <InputRow label="前期預估成本" value={inputs.estimatedUpfrontCost} onChange={v => setInputs({...inputs, estimatedUpfrontCost: v})} />
                 <InputRow label="實際投入成本" value={inputs.actualUpfrontCost} onChange={v => setInputs({...inputs, actualUpfrontCost: v})} />
-                <InputRow label="預估每月雜支" value={inputs.monthlyMisc} onChange={v => setInputs({...inputs, monthlyMisc: v})} />
+              </InputGroup>
+
+              {/* 新增：費用細項管理 */}
+              <InputGroup label="每月營運費用細項">
+                <InputRow label="管理費" value={inputs.expenseManagement} onChange={v => setInputs({...inputs, expenseManagement: v})} />
+                <InputRow label="修繕準備金" value={inputs.expenseMaintenance} onChange={v => setInputs({...inputs, expenseMaintenance: v})} />
+                <InputRow label="稅務攤提" value={inputs.expenseTax} onChange={v => setInputs({...inputs, expenseTax: v})} />
+                <InputRow label="保險費" value={inputs.expenseInsurance} onChange={v => setInputs({...inputs, expenseInsurance: v})} />
+                <InputRow label="其他雜支" value={inputs.expenseOther} onChange={v => setInputs({...inputs, expenseOther: v})} />
+                <div className="pt-2 mt-2 border-t border-dashed border-gray-200 flex justify-between items-center text-gray-500">
+                  <span className="text-xs font-bold">合計月支出</span>
+                  <span className="font-mono font-bold text-red-500">
+                    {formatMoney(
+                      (parseInt(inputs.expenseManagement)||0) + (parseInt(inputs.expenseMaintenance)||0) +
+                      (parseInt(inputs.expenseTax)||0) + (parseInt(inputs.expenseInsurance)||0) +
+                      (parseInt(inputs.expenseOther)||0)
+                    )}
+                  </span>
+                </div>
+              </InputGroup>
+
+              <InputGroup label="進階財測設定">
+                <InputRow label="折現率 (NPV用)" value={inputs.discountRate} onChange={v => setInputs({...inputs, discountRate: v})} suffix="%" />
               </InputGroup>
 
               <InputGroup label="資本投入比例">
@@ -425,11 +494,29 @@ export default function App() {
                 colorClass={typeof results.breakEvenMonths === 'number' ? "bg-indigo-600" : "bg-red-500"}
               />
 
+              {/* 進階財務指標區塊 (新增) */}
+              <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                <div className="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2"><TrendingUp size={16} className="text-purple-600"/>進階投資指標</div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="bg-purple-50 p-3 rounded-lg text-center">
+                    <div className="text-xs text-purple-700 mb-1 font-medium">IRR 內部報酬率</div>
+                    <div className={`text-xl font-bold ${parseFloat(results.irr) > 0 ? 'text-purple-700' : 'text-gray-500'}`}>{results.irr}%</div>
+                    <div className="text-[9px] text-gray-400">年化複利回報</div>
+                  </div>
+                  <div className="bg-blue-50 p-3 rounded-lg text-center">
+                    <div className="text-xs text-blue-700 mb-1 font-medium">NPV 淨現值</div>
+                    <div className={`text-xl font-bold ${results.npv > 0 ? 'text-blue-700' : 'text-red-500'}`}>{formatMoney(results.npv)}</div>
+                    <div className="text-[9px] text-gray-400">折現率 {inputs.discountRate}%</div>
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 text-center">
                 <div className="text-xs text-gray-400 mb-1">合約期滿總淨利 (扣除本金後)</div>
                 <div className={`text-2xl font-bold ${results.projectRealNetProfit > 0 ? 'text-green-600' : 'text-red-500'}`}>{formatMoney(results.projectRealNetProfit)}</div>
               </div>
 
+              {/* 資金方與人力方 (維持原樣) */}
               <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-200 relative overflow-hidden">
                 <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2 text-gray-900 font-bold"><Wallet className="text-green-600" size={20} />資金方</div>
@@ -472,16 +559,13 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 3: 月份明細 (可編輯模式) */}
+          {/* TAB 3: 月份明細 */}
           {activeTab === 'detail' && (
             <div className="animate-fadeIn bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
               <div className="p-3 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
                 <div className="text-xs text-gray-500 font-bold">現金流明細表 (點擊數字可修改)</div>
                 {Object.keys(monthlyOverrides).length > 0 && (
-                  <button 
-                    onClick={handleResetOverrides}
-                    className="text-[10px] bg-white border border-gray-200 px-2 py-1 rounded shadow-sm text-red-500 flex items-center gap-1"
-                  >
+                  <button onClick={handleResetOverrides} className="text-[10px] bg-white border border-gray-200 px-2 py-1 rounded shadow-sm text-red-500 flex items-center gap-1">
                     <RefreshCcw size={10} /> 恢復預設
                   </button>
                 )}
@@ -496,27 +580,12 @@ export default function App() {
                     {row.isOverridden && <span className="block text-[9px] text-blue-500">*手動</span>}
                     {row.cumulative >= inputs.actualUpfrontCost && results.monthlyData[idx-1]?.cumulative < inputs.actualUpfrontCost && <span className="block text-[10px] text-red-500 font-bold">★回本</span>}
                   </div>
-                  
-                  {/* 可編輯的收入欄位 */}
                   <div className="text-right">
-                    <input 
-                      type="number" 
-                      value={row.income}
-                      onChange={(e) => handleOverrideChange(idx, 'income', e.target.value)}
-                      className={`w-full text-right bg-transparent outline-none border-b border-transparent focus:border-blue-400 transition-colors ${monthlyOverrides[idx]?.income != null ? 'text-blue-600 font-bold' : 'text-gray-900'}`}
-                    />
+                    <input type="number" value={row.income} onChange={(e) => handleOverrideChange(idx, 'income', e.target.value)} className={`w-full text-right bg-transparent outline-none border-b border-transparent focus:border-blue-400 transition-colors ${monthlyOverrides[idx]?.income != null ? 'text-blue-600 font-bold' : 'text-gray-900'}`} />
                   </div>
-
-                  {/* 可編輯的支出欄位 */}
                   <div className="text-right">
-                    <input 
-                      type="number" 
-                      value={row.expense}
-                      onChange={(e) => handleOverrideChange(idx, 'expense', e.target.value)}
-                      className={`w-full text-right bg-transparent outline-none border-b border-transparent focus:border-red-400 transition-colors ${monthlyOverrides[idx]?.expense != null ? 'text-red-500 font-bold' : 'text-red-400'}`}
-                    />
+                    <input type="number" value={row.expense} onChange={(e) => handleOverrideChange(idx, 'expense', e.target.value)} className={`w-full text-right bg-transparent outline-none border-b border-transparent focus:border-red-400 transition-colors ${monthlyOverrides[idx]?.expense != null ? 'text-red-500 font-bold' : 'text-red-400'}`} />
                   </div>
-
                   <div className={`text-right font-mono font-medium text-xs ${row.netProfit > 0 ? 'text-green-600' : 'text-gray-400'}`}>{formatMoney(row.netProfit)}</div>
                 </div>
               ))}
@@ -530,22 +599,12 @@ export default function App() {
                 <div className="flex flex-col items-center justify-center h-64 text-gray-400 text-center p-6">
                   <User size={48} className="mb-4 opacity-20" />
                   <p className="mb-4">請先登入以查看或儲存歷史紀錄</p>
-                  <button onClick={handleLogin} className="bg-black text-white px-6 py-3 rounded-full font-bold shadow-lg hover:bg-gray-800 transition-all">
-                    使用 Google 登入
-                  </button>
+                  <button onClick={handleLogin} className="bg-black text-white px-6 py-3 rounded-full font-bold shadow-lg hover:bg-gray-800 transition-all">使用 Google 登入</button>
                 </div>
               )}
-              
-              {user && historyRecords.length === 0 && (
-                <div className="text-center text-gray-400 py-10 text-sm">尚無儲存的紀錄</div>
-              )}
-              
+              {user && historyRecords.length === 0 && <div className="text-center text-gray-400 py-10 text-sm">尚無儲存的紀錄</div>}
               {user && historyRecords.map((record) => (
-                <div 
-                  key={record.id} 
-                  onClick={() => handleLoadRecord(record)}
-                  className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 active:scale-[0.98] transition-transform cursor-pointer relative group"
-                >
+                <div key={record.id} onClick={() => handleLoadRecord(record)} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 active:scale-[0.98] transition-transform cursor-pointer relative group">
                   <div className="flex justify-between items-start">
                     <div>
                       <h3 className="font-bold text-gray-800 text-lg mb-1">{record.projectName || '未命名專案'}</h3>
@@ -554,26 +613,12 @@ export default function App() {
                         {record.monthlyOverrides && <span className="bg-blue-50 text-blue-600 px-1 rounded text-[10px]">含手動調整</span>}
                       </div>
                     </div>
-                    <button 
-                      onClick={(e) => handleDeleteRecord(record.id, e)}
-                      className="p-2 text-gray-300 hover:text-red-500 transition-colors z-10"
-                    >
-                      <Trash2 size={18} />
-                    </button>
+                    <button onClick={(e) => handleDeleteRecord(record.id, e)} className="p-2 text-gray-300 hover:text-red-500 transition-colors z-10"><Trash2 size={18} /></button>
                   </div>
-                  
                   <div className="flex gap-4 text-sm border-t border-gray-50 pt-3">
-                    <div>
-                      <span className="text-gray-400 text-xs block">年化報酬</span>
-                      <span className="font-bold text-green-600">{record.summary?.roi}%</span>
-                    </div>
-                    <div>
-                      <span className="text-gray-400 text-xs block">專案淨利</span>
-                      <span className="font-bold text-gray-700">{formatMoney(record.summary?.netProfit || 0)}</span>
-                    </div>
-                    <div className="ml-auto flex items-center text-blue-500 text-xs font-bold">
-                      載入 <ChevronRight size={14} />
-                    </div>
+                    <div><span className="text-gray-400 text-xs block">年化報酬</span><span className="font-bold text-green-600">{record.summary?.roi}%</span></div>
+                    <div><span className="text-gray-400 text-xs block">專案淨利</span><span className="font-bold text-gray-700">{formatMoney(record.summary?.netProfit || 0)}</span></div>
+                    <div className="ml-auto flex items-center text-blue-500 text-xs font-bold">載入 <ChevronRight size={14} /></div>
                   </div>
                 </div>
               ))}
@@ -584,22 +629,10 @@ export default function App() {
 
         {/* 底部 Tab Bar */}
         <div className="absolute bottom-0 w-full bg-white/90 backdrop-blur border-t border-gray-200 h-20 flex justify-around pt-2 pb-6 z-20">
-          <button onClick={() => setActiveTab('input')} className={`flex flex-col items-center w-16 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <Calculator size={24} strokeWidth={activeTab === 'input' ? 2.5 : 2} />
-            <span className="text-[10px] mt-1 font-medium">試算</span>
-          </button>
-          <button onClick={() => setActiveTab('report')} className={`flex flex-col items-center w-16 ${activeTab === 'report' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <PieChart size={24} strokeWidth={activeTab === 'report' ? 2.5 : 2} />
-            <span className="text-[10px] mt-1 font-medium">分析</span>
-          </button>
-          <button onClick={() => setActiveTab('detail')} className={`flex flex-col items-center w-16 ${activeTab === 'detail' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <List size={24} strokeWidth={activeTab === 'detail' ? 2.5 : 2} />
-            <span className="text-[10px] mt-1 font-medium">明細</span>
-          </button>
-          <button onClick={() => setActiveTab('history')} className={`flex flex-col items-center w-16 ${activeTab === 'history' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <History size={24} strokeWidth={activeTab === 'history' ? 2.5 : 2} />
-            <span className="text-[10px] mt-1 font-medium">紀錄</span>
-          </button>
+          <button onClick={() => setActiveTab('input')} className={`flex flex-col items-center w-16 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}><Calculator size={24} strokeWidth={activeTab === 'input' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">試算</span></button>
+          <button onClick={() => setActiveTab('report')} className={`flex flex-col items-center w-16 ${activeTab === 'report' ? 'text-blue-600' : 'text-gray-400'}`}><PieChart size={24} strokeWidth={activeTab === 'report' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">分析</span></button>
+          <button onClick={() => setActiveTab('detail')} className={`flex flex-col items-center w-16 ${activeTab === 'detail' ? 'text-blue-600' : 'text-gray-400'}`}><List size={24} strokeWidth={activeTab === 'detail' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">明細</span></button>
+          <button onClick={() => setActiveTab('history')} className={`flex flex-col items-center w-16 ${activeTab === 'history' ? 'text-blue-600' : 'text-gray-400'}`}><History size={24} strokeWidth={activeTab === 'history' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">紀錄</span></button>
         </div>
 
       </div>
