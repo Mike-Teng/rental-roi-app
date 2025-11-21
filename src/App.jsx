@@ -1,15 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, Percent, History, Trash2, ChevronRight, UploadCloud, X } from 'lucide-react';
+import { Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, Percent, History, Trash2, ChevronRight, UploadCloud, X, LogIn, LogOut, User } from 'lucide-react';
 
-// Import the functions you need from the SDKs you need
+// --- Firebase 模組導入 ---
 import { initializeApp } from "firebase/app";
+// 新增 Auth 相關模組
+import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "firebase/auth";
 import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp } from "firebase/firestore";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
 
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+// --- ⚠️ Firebase 設定 (請保持您原本填好的金鑰) ---
 const firebaseConfig = {
   apiKey: "AIzaSyC-4eqOa_YC-SdZZrjfEtKaUNtof5cfE9U",
   authDomain: "rental-roi-app.firebaseapp.com",
@@ -20,23 +18,39 @@ const firebaseConfig = {
   measurementId: "G-0DNQVXTCLZ"
 };
 
+// --- 全域變數宣告 ---
+let db = null;
+let auth = null; // 新增 auth 變數
 
-// 初始化 Firebase (只有在設定檔正確時才執行，避免報錯)
-let db;
+// --- 初始化 Firebase ---
 try {
   if (firebaseConfig.apiKey) {
     const app = initializeApp(firebaseConfig);
-    const analytics = getAnalytics(app);
     db = getFirestore(app);
-    console.log("Firebase 初始化成功");
+    auth = getAuth(app); // 初始化 Auth
+    console.log("Firebase & Auth 初始化成功");
   } else {
-    console.warn("⚠️ 注意：Firebase Config 未填寫，目前僅為離線試算模式。");
+    console.warn("⚠️ Firebase Config 未填寫");
   }
 } catch (e) {
   console.error("Firebase 初始化失敗:", e);
 }
 
 // --- UI 元件 ---
+
+const Notification = ({ message, type, onClose }) => {
+  if (!message) return null;
+  const bgColor = type === 'error' ? 'bg-red-500' : 'bg-green-600';
+  return (
+    <div className={`fixed top-4 left-1/2 transform -translate-x-1/2 ${bgColor} text-white px-6 py-3 rounded-full shadow-xl z-50 flex items-center gap-3 animate-bounce-in transition-all`}>
+      <span className="text-sm font-bold">{message}</span>
+      <button onClick={onClose} className="hover:bg-white/20 rounded-full p-1">
+        <X size={14} />
+      </button>
+    </div>
+  );
+};
+
 const InputGroup = ({ label, children }) => (
   <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3">
     <div className="text-xs font-bold text-gray-400 mb-2 uppercase tracking-wider">{label}</div>
@@ -52,7 +66,7 @@ const InputRow = ({ label, value, onChange, type = "number", suffix = "" }) => (
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="text-right font-semibold text-gray-900 outline-none bg-transparent w-32 placeholder-gray-300"
+        className="text-right font-semibold text-gray-900 outline-none bg-transparent w-32 placeholder-gray-300 focus:text-blue-600 transition-colors"
         placeholder="0"
       />
       {suffix && <span className="ml-2 text-sm text-gray-500 w-4">{suffix}</span>}
@@ -73,14 +87,18 @@ const ResultCard = ({ title, value, subValue, icon: Icon, colorClass = "bg-blue-
 
 const formatMoney = (num) => new Intl.NumberFormat('zh-TW').format(Math.round(num));
 
+// --- 主程式 ---
 export default function App() {
   const [activeTab, setActiveTab] = useState('input');
   const [historyRecords, setHistoryRecords] = useState([]);
   const [isSaving, setIsSaving] = useState(false);
+  const [notification, setNotification] = useState({ message: '', type: 'success' });
+  
+  // 新增：使用者狀態
+  const [user, setUser] = useState(null);
 
-  // --- 1. 輸入資料狀態 ---
   const [inputs, setInputs] = useState({
-    projectName: '我的租賃專案',   // 新增：專案名稱
+    projectName: '我的租賃專案',
     estimatedUpfrontCost: 2000000,
     actualUpfrontCost: 2200000,
     monthlyMisc: 5000,
@@ -96,64 +114,123 @@ export default function App() {
     startDate: '2025-12',
   });
 
-  // --- 2. Firebase 監聽與操作 ---
+  const showNotify = (msg, type = 'success') => {
+    setNotification({ message: msg, type });
+    setTimeout(() => setNotification({ message: '', type: 'success' }), 3000);
+  };
+
+  // --- 1. 監聽登入狀態 ---
   useEffect(() => {
-    if (!db) return;
-    // 監聽 'projects' 集合的變化 (即時更新)
-    const q = query(collection(db, "projects"), orderBy("createdAt", "desc"));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const records = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      setHistoryRecords(records);
+    if (!auth) return;
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
     });
     return () => unsubscribe();
   }, []);
 
+  // 登入功能
+  const handleLogin = async () => {
+    if (!auth) {
+      showNotify("Auth 未初始化，請檢查 Config", "error");
+      return;
+    }
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+      showNotify("登入成功！");
+    } catch (error) {
+      console.error("Login Failed:", error);
+      showNotify("登入失敗，請重試", "error");
+    }
+  };
+
+  // 登出功能
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      showNotify("已登出");
+      setHistoryRecords([]); // 清空畫面上的紀錄
+    } catch (error) {
+      showNotify("登出失敗", "error");
+    }
+  };
+
+  // --- 2. Firebase 資料庫監聽 (只有登入後才執行) ---
+  useEffect(() => {
+    if (!db || !user) return; // 沒登入就不監聽
+    
+    try {
+      const q = query(collection(db, "projects"), orderBy("createdAt", "desc"));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const records = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setHistoryRecords(records);
+      }, (error) => {
+        console.error("Firebase 讀取錯誤:", error);
+        if (error.code === 'permission-denied') {
+           // 如果規則沒設好，這裡會報錯
+        }
+      });
+      return () => unsubscribe();
+    } catch (err) {
+      console.error("Firebase Query 錯誤:", err);
+    }
+  }, [user]); // user 改變時重新執行
+
+  // 儲存到雲端
   const handleSaveToCloud = async () => {
     if (!db) {
-      alert("請先設定 Firebase Config 才能使用雲端儲存功能！");
+      showNotify("未連接資料庫", "error");
+      return;
+    }
+    if (!user) {
+      showNotify("請先登入才能儲存", "error");
       return;
     }
     setIsSaving(true);
     try {
       await addDoc(collection(db, "projects"), {
-        ...inputs, // 儲存所有輸入參數
-        createdAt: serverTimestamp(), // 加入伺服器時間
-        summary: { // 儲存關鍵結果供列表顯示
+        ...inputs,
+        userId: user.uid, // 紀錄是誰存的
+        authorName: user.displayName,
+        createdAt: serverTimestamp(),
+        summary: {
           roi: results.investorAnnualizedROI,
           netProfit: results.projectRealNetProfit
         }
       });
-      alert("儲存成功！");
-      setActiveTab('history'); // 存完跳轉到歷史頁
+      showNotify("儲存成功！");
+      setActiveTab('history');
     } catch (error) {
       console.error("Error adding document: ", error);
-      alert("儲存失敗，請檢查網路或權限");
+      showNotify("儲存失敗，權限不足", "error");
     }
     setIsSaving(false);
   };
 
   const handleDeleteRecord = async (id, e) => {
-    e.stopPropagation(); // 避免觸發點擊載入
-    if (!window.confirm("確定要刪除這筆紀錄嗎？")) return;
+    e.stopPropagation();
+    if (!db || !user) return;
+    
     try {
       await deleteDoc(doc(db, "projects", id));
+      showNotify("紀錄已刪除");
     } catch (error) {
       console.error("Error deleting document: ", error);
+      showNotify("刪除失敗，您可能沒有權限", "error");
     }
   };
 
   const handleLoadRecord = (record) => {
-    // 載入歷史紀錄到 inputs
-    // 排除 id, createdAt, summary 等非 input 欄位
-    const { id, createdAt, summary, ...recordInputs } = record;
+    // eslint-disable-next-line no-unused-vars
+    const { id, createdAt, summary, userId, authorName, ...recordInputs } = record;
     setInputs(prev => ({ ...prev, ...recordInputs }));
-    setActiveTab('report'); // 載入後跳轉到報表看結果
+    showNotify("已載入專案資料");
+    setActiveTab('report');
   };
 
-  // --- 3. 計算核心邏輯 (維持不變) ---
   const results = useMemo(() => {
     const start = new Date(inputs.startDate + '-01');
     const totalMonths = parseInt(inputs.contractMonths) || 0;
@@ -243,30 +320,39 @@ export default function App() {
   };
 
   return (
-    <div className="bg-gray-100 min-h-screen font-sans flex justify-center">
+    <div className="bg-gray-100 min-h-screen font-sans flex justify-center text-gray-900">
+      <Notification message={notification.message} type={notification.type} onClose={() => setNotification({ message: '', type: 'success' })} />
+
       <div className="w-full max-w-md bg-gray-50 h-[100dvh] flex flex-col relative shadow-2xl overflow-hidden">
         
         {/* 頂部導航 */}
-        <div className="bg-white px-5 pt-12 pb-4 shadow-sm z-10 flex justify-between items-center">
+        <div className="bg-white px-5 pt-12 pb-4 shadow-sm z-10 flex justify-between items-center shrink-0">
           <div>
             <h1 className="text-2xl font-bold text-gray-900">租賃專案試算</h1>
             <p className="text-xs text-gray-500 mt-1">Project ROI Calculator</p>
           </div>
-          {/* 只有在報表頁面才顯示儲存按鈕 */}
-          {activeTab === 'report' && (
-             <button 
-             onClick={handleSaveToCloud}
-             disabled={isSaving}
-             className="bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-bold shadow-md hover:bg-blue-700 flex items-center gap-1 transition-all active:scale-95"
-           >
-             {isSaving ? "儲存中..." : (
-                <>
-                  <UploadCloud size={14} />
-                  儲存結果
-                </>
-             )}
-           </button>
-          )}
+          
+          {/* 登入/登出/儲存 按鈕區 */}
+          <div className="flex items-center gap-2">
+            {user ? (
+              <>
+                {/* 已登入：顯示儲存與登出 */}
+                {activeTab === 'report' && (
+                  <button onClick={handleSaveToCloud} disabled={isSaving} className="bg-blue-600 text-white px-3 py-2 rounded-lg text-xs font-bold shadow hover:bg-blue-700 flex items-center gap-1">
+                    {isSaving ? "..." : <UploadCloud size={14} />}
+                  </button>
+                )}
+                <button onClick={handleLogout} className="bg-gray-100 text-gray-600 p-2 rounded-lg hover:bg-gray-200 transition-colors" title={`登出 ${user.displayName}`}>
+                  <LogOut size={16} />
+                </button>
+              </>
+            ) : (
+              /* 未登入：顯示登入按鈕 */
+              <button onClick={handleLogin} className="bg-black text-white px-3 py-2 rounded-lg text-xs font-bold shadow hover:bg-gray-800 flex items-center gap-1 transition-colors">
+                <LogIn size={14} /> 登入
+              </button>
+            )}
+          </div>
         </div>
 
         {/* 內容捲動區 */}
@@ -281,7 +367,7 @@ export default function App() {
                   type="text" 
                   value={inputs.projectName}
                   onChange={(e) => setInputs({...inputs, projectName: e.target.value})}
-                  className="w-full text-lg font-bold text-gray-800 border-b border-gray-200 pb-1 outline-none focus:border-blue-500 transition-colors"
+                  className="w-full text-lg font-bold text-gray-800 border-b border-gray-200 pb-1 outline-none focus:border-blue-500 transition-colors bg-transparent"
                   placeholder="請輸入專案名稱..."
                 />
               </div>
@@ -392,13 +478,24 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 4: 歷史紀錄 (新功能) */}
+          {/* TAB 4: 歷史紀錄 */}
           {activeTab === 'history' && (
             <div className="animate-fadeIn space-y-3">
-              {!db && <div className="text-center text-gray-400 py-10 text-sm">請設定 Firebase Config 以啟用雲端儲存</div>}
-              {db && historyRecords.length === 0 && <div className="text-center text-gray-400 py-10 text-sm">尚無儲存的紀錄</div>}
+              {!user && (
+                <div className="flex flex-col items-center justify-center h-64 text-gray-400 text-center p-6">
+                  <User size={48} className="mb-4 opacity-20" />
+                  <p className="mb-4">請先登入以查看或儲存歷史紀錄</p>
+                  <button onClick={handleLogin} className="bg-black text-white px-6 py-3 rounded-full font-bold shadow-lg hover:bg-gray-800 transition-all">
+                    使用 Google 登入
+                  </button>
+                </div>
+              )}
               
-              {historyRecords.map((record) => (
+              {user && historyRecords.length === 0 && (
+                <div className="text-center text-gray-400 py-10 text-sm">尚無儲存的紀錄</div>
+              )}
+              
+              {user && historyRecords.map((record) => (
                 <div 
                   key={record.id} 
                   onClick={() => handleLoadRecord(record)}
@@ -407,9 +504,10 @@ export default function App() {
                   <div className="flex justify-between items-start">
                     <div>
                       <h3 className="font-bold text-gray-800 text-lg mb-1">{record.projectName || '未命名專案'}</h3>
-                      <p className="text-xs text-gray-400 mb-2">
-                        {record.createdAt?.seconds ? new Date(record.createdAt.seconds * 1000).toLocaleString('zh-TW') : '剛剛'}
-                      </p>
+                      <div className="flex items-center gap-2 text-xs text-gray-400 mb-2">
+                        <span>{record.createdAt?.seconds ? new Date(record.createdAt.seconds * 1000).toLocaleString('zh-TW') : '剛剛'}</span>
+                        {record.authorName && <span className="bg-gray-100 px-1 rounded">by {record.authorName}</span>}
+                      </div>
                     </div>
                     <button 
                       onClick={(e) => handleDeleteRecord(record.id, e)}
@@ -429,7 +527,7 @@ export default function App() {
                       <span className="font-bold text-gray-700">{formatMoney(record.summary?.netProfit || 0)}</span>
                     </div>
                     <div className="ml-auto flex items-center text-blue-500 text-xs font-bold">
-                      載入試算 <ChevronRight size={14} />
+                      載入 <ChevronRight size={14} />
                     </div>
                   </div>
                 </div>
