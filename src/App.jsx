@@ -1,10 +1,18 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, Percent, History, Trash2, ChevronRight, UploadCloud, X, LogIn, LogOut, User, RefreshCcw, DollarSign, LayoutDashboard, Menu } from 'lucide-react';
+import { 
+  Calculator, PieChart, List, Calendar, Wallet, Briefcase, TrendingUp, 
+  Percent, History, Trash2, ChevronRight, UploadCloud, X, LogIn, LogOut, 
+  User, RefreshCcw, DollarSign, LayoutDashboard, Box, Settings, Save,
+  PiggyBank, PlusCircle
+} from 'lucide-react';
 
 // --- Firebase 模組導入 ---
 import { initializeApp } from "firebase/app";
 import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "firebase/auth";
-import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp } from "firebase/firestore";
+import { 
+  getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, 
+  query, orderBy, serverTimestamp, where, setDoc, getDoc 
+} from "firebase/firestore";
 
 // --- ⚠️ Firebase 設定 ---
 const firebaseConfig = {
@@ -118,24 +126,36 @@ const formatMoney = (num) => new Intl.NumberFormat('zh-TW').format(Math.round(nu
 export default function App() {
   const [activeTab, setActiveTab] = useState('input');
   const [historyRecords, setHistoryRecords] = useState([]);
+  
+  // --- 資金管理 States (Simplified) ---
+  const [monthlyLedger, setMonthlyLedger] = useState([]); // 改為 monthly_ledger
+  const [piggyBanks, setPiggyBanks] = useState([]); // 存錢筒
+  const [userSettings, setUserSettings] = useState({ initialCapital: 0 }); // 用戶設定(起始資金)
+  
+  // UI 互動狀態
   const [isSaving, setIsSaving] = useState(false);
   const [notification, setNotification] = useState({ message: '', type: 'success' });
   const [user, setUser] = useState(null);
   const [monthlyOverrides, setMonthlyOverrides] = useState({});
 
+  // 資金管理輸入暫存 (Simplified)
+  // 預設日期設為當前月份字串 'YYYY-MM'
+  const currentMonthStr = new Date().toISOString().slice(0, 7);
+  const [newMonthRecord, setNewMonthRecord] = useState({ month: currentMonthStr, income: '', expense: '' });
+  const [newPiggyBank, setNewPiggyBank] = useState({ name: '', percentage: '' });
+  const [isEditingCapital, setIsEditingCapital] = useState(false);
+  const [tempCapital, setTempCapital] = useState('');
+
   const [inputs, setInputs] = useState({
     projectName: '我的租賃專案',
     estimatedUpfrontCost: 2000000,
     actualUpfrontCost: 2200000,
-    
     expenseManagement: 2000,
     expenseMaintenance: 1000,
     expenseTax: 0,
     expenseInsurance: 0,
     expenseOther: 2000,
-    
     discountRate: 3,
-
     fundInjectionRatio: 80,
     manpowerInjectionRatio: 20,
     fundProfitRatio: 30,
@@ -167,24 +187,168 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    try { await signOut(auth); showNotify("已登出"); setHistoryRecords([]); }
+    try { 
+      await signOut(auth); 
+      showNotify("已登出"); 
+      setHistoryRecords([]); 
+      setMonthlyLedger([]); 
+      setPiggyBanks([]); 
+      setUserSettings({initialCapital:0}); 
+    }
     catch (error) { showNotify("登出失敗", "error"); }
   };
 
-  // 2. Firebase 監聽
+  // 2. Firebase 監聽 (Projects)
   useEffect(() => {
     if (!db || !user) return;
     try {
+      // 這裡使用了 orderBy，如果沒有建立索引可能會報錯，但通常 projects 比較簡單
       const q = query(collection(db, "projects"), orderBy("createdAt", "desc"));
       const unsubscribe = onSnapshot(q, (snapshot) => {
         const records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         setHistoryRecords(records);
-      }, (error) => console.error("Firebase 讀取錯誤:", error));
+      }, (error) => console.error("Firebase Projects 讀取錯誤:", error));
       return () => unsubscribe();
-    } catch (err) { console.error("Firebase Query 錯誤:", err); }
+    } catch (err) { console.error("Firebase Projects Query 錯誤:", err); }
   }, [user]);
 
-  // 儲存
+  // 3. Firebase 監聽 (資金管理相關) - 修正版
+  useEffect(() => {
+    if (!db || !user) return;
+    try {
+      // --- 修正重點 ---
+      // 移除 orderBy("month", "desc")，改為只用 where 篩選
+      // 避免因為缺少 Firebase 複合索引導致讀取失敗 (Permission Denied 或 Requires Index)
+      const qLedger = query(collection(db, "monthly_ledger"), where("userId", "==", user.uid));
+      
+      const unsubLedger = onSnapshot(qLedger, (snap) => {
+        // 在前端 JavaScript 進行排序 (日期字串比較)
+        const sortedData = snap.docs
+          .map(d => ({id:d.id, ...d.data()}))
+          .sort((a, b) => b.month.localeCompare(a.month)); // 降序排列
+        
+        setMonthlyLedger(sortedData);
+      }, (error) => {
+        console.error("Ledger 讀取錯誤:", error);
+        // 如果還是失敗，嘗試不帶 where (但在這個 app 架構下不建議，除非真的找不到原因)
+      });
+
+      // 監聽存錢筒設定
+      const qBanks = query(collection(db, "piggy_banks"), where("userId", "==", user.uid));
+      const unsubBanks = onSnapshot(qBanks, (snap) => setPiggyBanks(snap.docs.map(d => ({id:d.id, ...d.data()}))));
+
+      // 讀取/監聽使用者設定 (起始資金)
+      const loadSettings = async () => {
+        const docRef = doc(db, "user_settings", user.uid);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          setUserSettings(docSnap.data());
+        } else {
+          await setDoc(docRef, { initialCapital: 0 }); // 初始化
+        }
+      };
+      loadSettings();
+
+      return () => { unsubLedger(); unsubBanks(); };
+    } catch (err) { console.error("Firebase Funds Query 錯誤:", err); }
+  }, [user]);
+
+  // --- 資金管理邏輯 ---
+
+  // 計算資金池數據
+  const fundStats = useMemo(() => {
+    // 1. 計算所有月份的總收支 (從 monthly_ledger)
+    const totalIncome = monthlyLedger.reduce((sum, item) => sum + (Number(item.income) || 0), 0);
+    const totalExpense = monthlyLedger.reduce((sum, item) => sum + (Number(item.expense) || 0), 0);
+    const netLedgerProfit = totalIncome - totalExpense; // 這是「總經營盈餘」
+
+    // 2. 當前總水位 = 起始本金 + 總經營盈餘
+    const currentTotalCash = (Number(userSettings.initialCapital) || 0) + netLedgerProfit;
+
+    // 3. 存錢筒分配邏輯 (Modified: 只根據「盈餘」來分配)
+    // 如果總盈餘 < 0，代表目前賠錢，則不分配存錢筒 (base = 0)
+    const allocationBase = Math.max(0, netLedgerProfit); 
+    
+    let allocatedTotal = 0;
+    const calculatedBanks = piggyBanks.map(bank => {
+      const allocation = Math.floor(allocationBase * (Number(bank.percentage) / 100));
+      allocatedTotal += allocation;
+      return { ...bank, currentAmount: allocation };
+    });
+
+    // 4. 自由現金 = 總水位 - 已分配到存錢筒的錢
+    const freeCash = currentTotalCash - allocatedTotal;
+
+    return {
+      totalIncome,
+      totalExpense,
+      netLedgerProfit,
+      currentTotalCash,
+      calculatedBanks,
+      freeCash,
+      allocationBase // 顯示用，讓用戶知道分配基礎是盈餘
+    };
+  }, [monthlyLedger, userSettings.initialCapital, piggyBanks]);
+
+  // 更新起始資金
+  const handleUpdateCapital = async () => {
+    if(!db || !user) return;
+    try {
+      await setDoc(doc(db, "user_settings", user.uid), { initialCapital: Number(tempCapital) }, { merge: true });
+      setUserSettings(prev => ({ ...prev, initialCapital: Number(tempCapital) }));
+      setIsEditingCapital(false);
+      showNotify("起始資金已更新");
+    } catch(e) { showNotify("更新失敗", "error"); }
+  };
+
+  // 新增/更新 每月收支紀錄
+  const handleAddMonthlyRecord = async () => {
+    if(!db || !user || !newMonthRecord.month) { showNotify("請選擇月份", "error"); return; }
+    
+    // 簡單驗證：收入與支出若未填寫則視為 0
+    const incomeVal = Number(newMonthRecord.income) || 0;
+    const expenseVal = Number(newMonthRecord.expense) || 0;
+
+    try {
+      await addDoc(collection(db, "monthly_ledger"), {
+        month: newMonthRecord.month,
+        income: incomeVal,
+        expense: expenseVal,
+        userId: user.uid,
+        createdAt: serverTimestamp()
+      });
+      setNewMonthRecord({ month: currentMonthStr, income: '', expense: '' });
+      showNotify("收支紀錄已儲存");
+    } catch(e) { showNotify("儲存失敗", "error"); }
+  };
+
+  // 新增存錢筒
+  const handleAddPiggyBank = async () => {
+    if(!db || !user || !newPiggyBank.name || !newPiggyBank.percentage) return;
+    const currentTotalPercent = piggyBanks.reduce((sum, b) => sum + Number(b.percentage), 0);
+    if (currentTotalPercent + Number(newPiggyBank.percentage) > 100) {
+      showNotify(`分配比例總和不可超過 100% (目前 ${currentTotalPercent}%)`, "error");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, "piggy_banks"), {
+        name: newPiggyBank.name,
+        percentage: Number(newPiggyBank.percentage),
+        userId: user.uid
+      });
+      setNewPiggyBank({ name: '', percentage: '' });
+      showNotify("存錢筒已建立");
+    } catch(e) { showNotify("建立失敗", "error"); }
+  };
+
+  const handleDeleteDoc = async (col, id) => {
+    if(!window.confirm("確定刪除？")) return;
+    try { await deleteDoc(doc(db, col, id)); showNotify("已刪除"); }
+    catch(e) { showNotify("刪除失敗", "error"); }
+  };
+
+  // --- 原本的 ROI 專案儲存邏輯 ---
   const handleSaveToCloud = async () => {
     if (!db || !user) { showNotify("請先登入並連接資料庫", "error"); return; }
     setIsSaving(true);
@@ -212,21 +376,13 @@ export default function App() {
 
   const handleLoadRecord = (record) => {
     const { id, createdAt, summary, userId, authorName, monthlyOverrides: savedOverrides, ...recordInputs } = record;
-    
     if (recordInputs.monthlyMisc && recordInputs.expenseOther === undefined) {
       recordInputs.expenseOther = recordInputs.monthlyMisc;
-      recordInputs.expenseManagement = 0;
-      recordInputs.expenseMaintenance = 0;
-      recordInputs.expenseTax = 0;
-      recordInputs.expenseInsurance = 0;
+      recordInputs.expenseManagement = 0; recordInputs.expenseMaintenance = 0; recordInputs.expenseTax = 0; recordInputs.expenseInsurance = 0;
     }
-
     setInputs(prev => ({ ...prev, ...recordInputs }));
-    
-    if (savedOverrides) {
-      try { setMonthlyOverrides(JSON.parse(savedOverrides)); } catch (e) { setMonthlyOverrides({}); }
-    } else { setMonthlyOverrides({}); }
-    
+    if (savedOverrides) { try { setMonthlyOverrides(JSON.parse(savedOverrides)); } catch (e) { setMonthlyOverrides({}); } } 
+    else { setMonthlyOverrides({}); }
     showNotify("已載入專案資料");
     setActiveTab('report');
   };
@@ -244,33 +400,20 @@ export default function App() {
     });
   };
 
-  const handleResetOverrides = () => {
-    if (window.confirm("確定要清除所有手動修改，恢復預設值嗎？")) {
-      setMonthlyOverrides({});
-      showNotify("已恢復預設值");
-    }
-  };
+  const handleResetOverrides = () => { if (window.confirm("確定恢復預設值？")) { setMonthlyOverrides({}); showNotify("已恢復"); } };
 
-  // --- 3. 計算核心邏輯 (含 IRR & NPV) ---
+  // --- 核心 ROI 計算 ---
   const results = useMemo(() => {
     const start = new Date(inputs.startDate + '-01');
     const totalMonths = parseInt(inputs.contractMonths) || 0;
     const p1Months = parseInt(inputs.phase1Months) || 0;
     const actualCost = parseInt(inputs.actualUpfrontCost) || 0;
     const discountRateAnnual = (parseFloat(inputs.discountRate) || 0) / 100;
-    
     const fundInjPct = (parseFloat(inputs.fundInjectionRatio) || 0) / 100;
     const manInjPct = (parseFloat(inputs.manpowerInjectionRatio) || 0) / 100;
     const fundProfPct = (parseFloat(inputs.fundProfitRatio) || 0) / 100;
     const manProfPct = (parseFloat(inputs.manpowerProfitRatio) || 0) / 100;
-
-    const baseExpense = 
-      (parseInt(inputs.expenseManagement) || 0) +
-      (parseInt(inputs.expenseMaintenance) || 0) +
-      (parseInt(inputs.expenseTax) || 0) +
-      (parseInt(inputs.expenseInsurance) || 0) +
-      (parseInt(inputs.expenseOther) || 0);
-
+    const baseExpense = (parseInt(inputs.expenseManagement)||0)+(parseInt(inputs.expenseMaintenance)||0)+(parseInt(inputs.expenseTax)||0)+(parseInt(inputs.expenseInsurance)||0)+(parseInt(inputs.expenseOther)||0);
     const rent1 = parseInt(inputs.rentPhase1) || 0;
     const rent2 = parseInt(inputs.rentPhase2) || 0;
     const baseIncome = parseInt(inputs.monthlyIncome) || 0;
@@ -280,7 +423,6 @@ export default function App() {
     let breakEvenMonthIndex = -1;
     let totalRevenue = 0;
     let totalExpenses = 0;
-    
     const monthlyData = [];
     const netCashFlowsForIRR = [-actualCost];
 
@@ -288,85 +430,49 @@ export default function App() {
       const currentMonthDate = new Date(start);
       currentMonthDate.setMonth(start.getMonth() + i);
       const dateStr = `${currentMonthDate.getFullYear()}/${String(currentMonthDate.getMonth() + 1).padStart(2, '0')}`;
-
       const currentRent = i < p1Months ? rent1 : rent2;
       const defaultExpense = currentRent + baseExpense;
-      
       let defaultIncome = baseIncome;
       if (i >= 12) defaultIncome = Math.round(baseIncome * 0.95);
-
       const override = monthlyOverrides[i] || {};
       const currentIncome = override.income != null ? override.income : defaultIncome;
       const currentExpense = override.expense != null ? override.expense : defaultExpense;
-      
       const netCashFlow = currentIncome - currentExpense;
-      
       cumulativeCashFlow += netCashFlow;
       totalRevenue += currentIncome;
       totalExpenses += currentExpense;
       netCashFlowsForIRR.push(netCashFlow);
-
-      if (breakEvenMonthIndex === -1 && cumulativeCashFlow >= actualCost) {
-        breakEvenMonthIndex = i + 1;
-        breakEvenDate = dateStr;
-      }
-
-      monthlyData.push({
-        month: i + 1, 
-        date: dateStr, 
-        income: currentIncome,
-        expense: currentExpense, 
-        netProfit: netCashFlow, 
-        cumulative: cumulativeCashFlow,
-        isOverridden: override.income != null || override.expense != null
-      });
+      if (breakEvenMonthIndex === -1 && cumulativeCashFlow >= actualCost) { breakEvenMonthIndex = i + 1; breakEvenDate = dateStr; }
+      monthlyData.push({ month: i + 1, date: dateStr, income: currentIncome, expense: currentExpense, netProfit: netCashFlow, cumulative: cumulativeCashFlow, isOverridden: override.income != null || override.expense != null });
     }
 
     const monthlyDiscountRate = discountRateAnnual / 12;
     const npv = calculateNPV(monthlyDiscountRate, actualCost, netCashFlowsForIRR.slice(1));
     const monthlyIRR = calculateIRR(netCashFlowsForIRR);
     const annualIRR = monthlyIRR ? (Math.pow(1 + monthlyIRR, 12) - 1) * 100 : 0;
-
     const monthlyAmortization = totalMonths > 0 ? Math.round(actualCost / totalMonths) : 0;
     const monthlyTotalCostWithAmort = totalMonths > 0 ? Math.round((totalExpenses / totalMonths) + monthlyAmortization) : 0;
     const avgMonthlyNetIncome = totalMonths > 0 ? Math.round((totalRevenue - totalExpenses - actualCost) / totalMonths) : 0; 
-    
     const projectRealNetProfit = cumulativeCashFlow - actualCost;
-
     const investorProfitShare = projectRealNetProfit > 0 ? projectRealNetProfit * fundProfPct : 0;
     const operatorProfitShare = projectRealNetProfit > 0 ? projectRealNetProfit * manProfPct : 0;
-    
     const investorPrincipal = actualCost * fundInjPct;
     const operatorPrincipal = actualCost * manInjPct;
-
     const years = totalMonths / 12;
-    const investorAnnualizedROI = (investorPrincipal > 0 && years > 0) 
-      ? ((investorProfitShare / investorPrincipal) / years * 100).toFixed(1) : "0.0";
-    const operatorAnnualizedROI = (operatorPrincipal > 0 && years > 0)
-      ? ((operatorProfitShare / operatorPrincipal) / years * 100).toFixed(1) : "0.0";
-
+    const investorAnnualizedROI = (investorPrincipal > 0 && years > 0) ? ((investorProfitShare / investorPrincipal) / years * 100).toFixed(1) : "0.0";
+    const operatorAnnualizedROI = (operatorPrincipal > 0 && years > 0) ? ((operatorProfitShare / operatorPrincipal) / years * 100).toFixed(1) : "0.0";
     const totalCostIncludingUpfront = totalExpenses + actualCost;
     const costRatio = totalRevenue > 0 ? (totalCostIncludingUpfront / totalRevenue * 100).toFixed(1) : 0;
 
-    return {
-      breakEvenDate: breakEvenDate || '未回本',
-      breakEvenMonths: breakEvenMonthIndex === -1 ? '-' : breakEvenMonthIndex,
-      investorPrincipal, investorProfitShare, investorAnnualizedROI,
-      operatorPrincipal, operatorProfitShare, operatorAnnualizedROI,
-      projectRealNetProfit, monthlyAmortization, monthlyTotalCostWithAmort,
-      avgMonthlyNetIncome, costRatio, monthlyData,
-      npv: Math.round(npv),
-      irr: annualIRR.toFixed(2)
-    };
+    return { breakEvenDate: breakEvenDate || '未回本', breakEvenMonths: breakEvenMonthIndex === -1 ? '-' : breakEvenMonthIndex, investorPrincipal, investorProfitShare, investorAnnualizedROI, operatorPrincipal, operatorProfitShare, operatorAnnualizedROI, projectRealNetProfit, monthlyAmortization, monthlyTotalCostWithAmort, avgMonthlyNetIncome, costRatio, monthlyData, npv: Math.round(npv), irr: annualIRR.toFixed(2) };
   }, [inputs, monthlyOverrides]);
 
   const handleRatioChange = (keyA, keyB, value) => {
-    const val = parseFloat(value);
-    if (isNaN(val)) return;
+    const val = parseFloat(value); if (isNaN(val)) return;
     setInputs(prev => ({ ...prev, [keyA]: val, [keyB]: 100 - val }));
   };
 
-  // --- 導航組件 (共用) ---
+  // --- UI Components ---
   const NavItem = ({ id, label, icon: Icon, active }) => (
     <button 
       onClick={() => setActiveTab(id)}
@@ -381,10 +487,9 @@ export default function App() {
     <div className="bg-gray-100 min-h-screen font-sans flex justify-center text-gray-900 md:p-6 md:items-center">
       <Notification message={notification.message} type={notification.type} onClose={() => setNotification({ message: '', type: 'success' })} />
 
-      {/* Main Container: Mobile (Full Screen) / Desktop (Card with Sidebar) */}
       <div className="w-full md:max-w-7xl bg-gray-50 h-[100dvh] md:h-[90vh] md:min-h-[800px] flex flex-col md:flex-row relative shadow-2xl md:rounded-3xl overflow-hidden border border-gray-200">
         
-        {/* --- Desktop Sidebar (Hidden on Mobile) --- */}
+        {/* Sidebar */}
         <div className="hidden md:flex flex-col w-72 bg-white border-r border-gray-100 p-6 shrink-0">
           <div className="mb-10 px-2">
             <h1 className="text-2xl font-black text-gray-900 tracking-tight flex items-center gap-2">
@@ -398,6 +503,9 @@ export default function App() {
             <NavItem id="report" label="報表分析" icon={PieChart} active={activeTab === 'report'} />
             <NavItem id="detail" label="現金流明細" icon={List} active={activeTab === 'detail'} />
             <NavItem id="history" label="歷史紀錄" icon={History} active={activeTab === 'history'} />
+            <div className="my-2 border-t border-gray-100"></div>
+            {/* 更新導航：資金管理 */}
+            <NavItem id="assets" label="資金管理" icon={Wallet} active={activeTab === 'assets'} />
           </div>
 
           <div className="mt-auto border-t border-gray-100 pt-6">
@@ -457,6 +565,7 @@ export default function App() {
               {activeTab === 'report' && '分析總覽'}
               {activeTab === 'detail' && '現金流明細'}
               {activeTab === 'history' && '歷史存檔'}
+              {activeTab === 'assets' && '資金管理'}
             </h2>
             {activeTab === 'report' && user && (
               <button 
@@ -472,7 +581,7 @@ export default function App() {
           {/* Content Scroll Area */}
           <div className="flex-1 overflow-y-auto p-4 md:p-8 pb-24 md:pb-8">
             
-            {/* TAB 1: 輸入設定 (Responsive Grid) */}
+            {/* TAB 1: 輸入設定 */}
             {activeTab === 'input' && (
               <div className="animate-fadeIn max-w-5xl mx-auto">
                  <div className="bg-white p-4 md:p-6 rounded-xl shadow-sm border border-gray-100 mb-6">
@@ -494,16 +603,6 @@ export default function App() {
                       <InputRow label="稅務攤提" value={inputs.expenseTax} onChange={v => setInputs({...inputs, expenseTax: v})} />
                       <InputRow label="保險費" value={inputs.expenseInsurance} onChange={v => setInputs({...inputs, expenseInsurance: v})} />
                       <InputRow label="其他雜支" value={inputs.expenseOther} onChange={v => setInputs({...inputs, expenseOther: v})} />
-                      <div className="pt-2 mt-2 border-t border-dashed border-gray-200 flex justify-between items-center text-gray-500">
-                        <span className="text-xs font-bold">合計月支出</span>
-                        <span className="font-mono font-bold text-red-500">
-                          {formatMoney(
-                            (parseInt(inputs.expenseManagement)||0) + (parseInt(inputs.expenseMaintenance)||0) +
-                            (parseInt(inputs.expenseTax)||0) + (parseInt(inputs.expenseInsurance)||0) +
-                            (parseInt(inputs.expenseOther)||0)
-                          )}
-                        </span>
-                      </div>
                     </InputGroup>
                   </div>
 
@@ -532,14 +631,13 @@ export default function App() {
 
                     <InputGroup label="收入預估">
                       <InputRow label="每月房客租金" value={inputs.monthlyIncome} onChange={v => setInputs({...inputs, monthlyIncome: v})} />
-                      <div className="text-[10px] text-gray-400 text-right px-1 mt-1">*註：第一年後租金自動 * 0.95 計算</div>
                     </InputGroup>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* TAB 2: 報表結果 (Responsive Grid) */}
+            {/* TAB 2: 報表結果 */}
             {activeTab === 'report' && (
               <div className="animate-fadeIn max-w-6xl mx-auto space-y-6">
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -679,14 +777,163 @@ export default function App() {
               </div>
             )}
 
+            {/* TAB 5: 資金管理 (Funds) - 全新設計 */}
+            {activeTab === 'assets' && (
+              <div className="animate-fadeIn max-w-5xl mx-auto space-y-8">
+                {!user ? (
+                   <div className="flex flex-col items-center justify-center h-64 text-gray-400 text-center p-6 bg-white rounded-2xl border border-gray-100 border-dashed">
+                   <Wallet size={48} className="mb-4 opacity-20" />
+                   <p className="mb-4">請先登入以使用資金管理功能</p>
+                   <button onClick={handleLogin} className="bg-black text-white px-6 py-3 rounded-full font-bold shadow-lg">登入</button>
+                 </div>
+                ) : (
+                  <>
+                    {/* 1. 資金儀表板 (Cash Dashboard) */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {/* 當前現金水位 */}
+                      <div className="bg-gradient-to-br from-blue-900 to-slate-900 text-white p-6 rounded-2xl shadow-xl relative overflow-hidden">
+                         <div className="absolute top-0 right-0 p-4 opacity-10"><DollarSign size={100}/></div>
+                         <div className="flex items-center gap-2 mb-4 text-blue-200 font-medium text-sm"><Wallet size={16}/> 當前現金水位</div>
+                         <div className="text-4xl font-bold tracking-tight mb-2">{formatMoney(fundStats.currentTotalCash)}</div>
+                         <div className="flex items-center gap-2 text-xs opacity-70">
+                            <span>初始: {formatMoney(userSettings.initialCapital)}</span>
+                            <span>+</span>
+                            <span>營收淨利: {formatMoney(fundStats.netLedgerProfit)}</span>
+                         </div>
+                      </div>
+
+                      {/* 自由現金 (Free Cash) */}
+                      <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col justify-between">
+                         <div className="flex items-center gap-2 text-gray-500 font-medium text-sm"><Box size={16}/> 可動用自由現金</div>
+                         <div className="text-3xl font-bold text-green-600">{formatMoney(fundStats.freeCash)}</div>
+                         <div className="text-xs text-gray-400 mt-2">已扣除所有存錢筒保留款</div>
+                      </div>
+
+                      {/* 起始資金設定 (Initial Capital) */}
+                      <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col justify-center">
+                         <div className="flex justify-between items-center mb-2">
+                            <span className="text-sm font-bold text-gray-700">起始資金設定</span>
+                            {!isEditingCapital && <button onClick={()=>{setTempCapital(userSettings.initialCapital); setIsEditingCapital(true)}} className="p-1 hover:bg-gray-100 rounded"><Settings size={14}/></button>}
+                         </div>
+                         {isEditingCapital ? (
+                           <div className="flex gap-2">
+                             <input type="number" value={tempCapital} onChange={e=>setTempCapital(e.target.value)} className="w-full border rounded px-2 py-1 text-lg font-bold outline-none border-blue-500"/>
+                             <button onClick={handleUpdateCapital} className="bg-blue-600 text-white px-3 rounded"><Save size={16}/></button>
+                           </div>
+                         ) : (
+                           <div className="text-2xl font-bold text-gray-800">{formatMoney(userSettings.initialCapital)}</div>
+                         )}
+                         <div className="text-xs text-gray-400 mt-1">專案啟動時的本金</div>
+                      </div>
+                    </div>
+
+                    {/* 2. 智慧存錢筒 (Smart Piggy Banks) */}
+                    <div>
+                      <h3 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2"><PiggyBank className="text-pink-500"/> 智慧存錢筒 (只分配盈餘)</h3>
+                      <div className="flex gap-4 overflow-x-auto pb-4">
+                         {/* 新增卡片 */}
+                         <div className="min-w-[200px] bg-white border border-dashed border-gray-300 rounded-2xl p-5 flex flex-col items-center justify-center gap-3 shrink-0">
+                            <div className="text-sm font-bold text-gray-500">新增存錢筒</div>
+                            <input type="text" placeholder="名稱 (如:稅務)" value={newPiggyBank.name} onChange={e=>setNewPiggyBank({...newPiggyBank, name:e.target.value})} className="w-full text-center text-sm border-b border-gray-200 outline-none pb-1"/>
+                            <div className="flex items-center gap-1 w-full">
+                              <input type="number" placeholder="比例" value={newPiggyBank.percentage} onChange={e=>setNewPiggyBank({...newPiggyBank, percentage:e.target.value})} className="w-full text-center text-sm border-b border-gray-200 outline-none pb-1"/>
+                              <span className="text-xs text-gray-400">%</span>
+                            </div>
+                            <button onClick={handleAddPiggyBank} className="bg-gray-900 text-white text-xs px-4 py-2 rounded-full font-bold hover:bg-gray-700 transition-colors w-full">建立</button>
+                         </div>
+
+                         {/* 存錢筒列表 */}
+                         {fundStats.calculatedBanks.map(bank => (
+                           <div key={bank.id} className="min-w-[220px] bg-white border border-gray-100 shadow-sm rounded-2xl p-5 flex flex-col justify-between relative group shrink-0">
+                              <button onClick={()=>handleDeleteDoc('piggy_banks', bank.id)} className="absolute top-2 right-2 text-gray-200 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"><X size={14}/></button>
+                              <div>
+                                <div className="text-gray-500 text-xs font-bold uppercase mb-1">{bank.name}</div>
+                                <div className="text-2xl font-bold text-gray-800">{formatMoney(bank.currentAmount)}</div>
+                              </div>
+                              <div className="mt-4">
+                                <div className="flex justify-between text-xs text-gray-400 mb-1">
+                                  <span>分配盈餘比例</span>
+                                  <span className="font-bold text-blue-600">{bank.percentage}%</span>
+                                </div>
+                                <div className="w-full bg-gray-100 h-1.5 rounded-full overflow-hidden">
+                                  <div className="bg-pink-400 h-full rounded-full" style={{width: `${bank.percentage}%`}}></div>
+                                </div>
+                              </div>
+                           </div>
+                         ))}
+                      </div>
+                      <div className="text-xs text-gray-400 text-right px-2">* 目前累積總盈餘基數: {formatMoney(fundStats.allocationBase)} (若為負值則不分配)</div>
+                    </div>
+
+                    {/* 3. 簡易收支帳本 (Simple Monthly Ledger) */}
+                    <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden flex flex-col h-[500px]">
+                      <div className="p-4 border-b border-gray-100 bg-gray-50 flex justify-between items-center">
+                        <h3 className="font-bold text-gray-700 flex items-center gap-2"><List size={18} /> 每月收支紀錄</h3>
+                        <div className="text-xs text-gray-400">請輸入每月的總收入與總支出</div>
+                      </div>
+                      
+                      {/* 輸入區 (Input Row) */}
+                      <div className="p-4 bg-blue-50/50 border-b border-gray-100 grid grid-cols-12 gap-3 items-end">
+                         <div className="col-span-3">
+                            <label className="text-[10px] font-bold text-gray-400 uppercase mb-1 block">月份</label>
+                            <input type="month" value={newMonthRecord.month} onChange={e=>setNewMonthRecord({...newMonthRecord, month:e.target.value})} className="w-full bg-white border border-gray-200 rounded px-2 py-1.5 text-sm font-bold outline-none focus:border-blue-500"/>
+                         </div>
+                         <div className="col-span-4">
+                            <label className="text-[10px] font-bold text-gray-400 uppercase mb-1 block">總收入</label>
+                            <input type="number" placeholder="0" value={newMonthRecord.income} onChange={e=>setNewMonthRecord({...newMonthRecord, income:e.target.value})} className="w-full bg-white border border-gray-200 rounded px-2 py-1.5 text-sm font-bold outline-none focus:border-green-500 text-green-600"/>
+                         </div>
+                         <div className="col-span-4">
+                            <label className="text-[10px] font-bold text-gray-400 uppercase mb-1 block">總支出</label>
+                            <input type="number" placeholder="0" value={newMonthRecord.expense} onChange={e=>setNewMonthRecord({...newMonthRecord, expense:e.target.value})} className="w-full bg-white border border-gray-200 rounded px-2 py-1.5 text-sm font-bold outline-none focus:border-red-500 text-red-500"/>
+                         </div>
+                         <div className="col-span-1">
+                            <button onClick={handleAddMonthlyRecord} className="w-full bg-blue-600 text-white rounded h-[34px] flex items-center justify-center hover:bg-blue-700 transition-colors"><PlusCircle size={18}/></button>
+                         </div>
+                      </div>
+
+                      {/* 列表 (List) */}
+                      <div className="flex-1 overflow-y-auto">
+                        <div className="grid grid-cols-12 bg-gray-50 p-2 text-xs font-bold text-gray-500 border-b border-gray-200 sticky top-0">
+                          <div className="col-span-3 pl-2">月份</div>
+                          <div className="col-span-3 text-right">總收入</div>
+                          <div className="col-span-3 text-right">總支出</div>
+                          <div className="col-span-2 text-right">淨利</div>
+                          <div className="col-span-1"></div>
+                        </div>
+                         {monthlyLedger.map(item => {
+                           const net = (Number(item.income)||0) - (Number(item.expense)||0);
+                           return (
+                             <div key={item.id} className="grid grid-cols-12 p-3 border-b border-gray-50 items-center hover:bg-gray-50 group transition-colors">
+                                <div className="col-span-3 pl-2 font-bold text-gray-800">{item.month}</div>
+                                <div className="col-span-3 text-right text-green-600 font-mono">{formatMoney(item.income)}</div>
+                                <div className="col-span-3 text-right text-red-500 font-mono">{formatMoney(item.expense)}</div>
+                                <div className={`col-span-2 text-right font-mono font-bold ${net>=0?'text-gray-800':'text-red-600'}`}>
+                                  {net>=0?'+':''}{formatMoney(net)}
+                                </div>
+                                <div className="col-span-1 text-center">
+                                  <button onClick={()=>handleDeleteDoc('monthly_ledger', item.id)} className="text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"><Trash2 size={14}/></button>
+                                </div>
+                             </div>
+                           );
+                         })}
+                         {monthlyLedger.length === 0 && <div className="text-center text-gray-300 text-xs py-10">尚無月結紀錄</div>}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
           </div>
 
           {/* Mobile Bottom Tab Bar (Hidden on Desktop) */}
           <div className="md:hidden absolute bottom-0 w-full bg-white/90 backdrop-blur border-t border-gray-200 h-20 flex justify-around pt-2 pb-6 z-20">
-            <button onClick={() => setActiveTab('input')} className={`flex flex-col items-center w-16 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}><LayoutDashboard size={24} strokeWidth={activeTab === 'input' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">試算</span></button>
-            <button onClick={() => setActiveTab('report')} className={`flex flex-col items-center w-16 ${activeTab === 'report' ? 'text-blue-600' : 'text-gray-400'}`}><PieChart size={24} strokeWidth={activeTab === 'report' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">分析</span></button>
-            <button onClick={() => setActiveTab('detail')} className={`flex flex-col items-center w-16 ${activeTab === 'detail' ? 'text-blue-600' : 'text-gray-400'}`}><List size={24} strokeWidth={activeTab === 'detail' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">明細</span></button>
-            <button onClick={() => setActiveTab('history')} className={`flex flex-col items-center w-16 ${activeTab === 'history' ? 'text-blue-600' : 'text-gray-400'}`}><History size={24} strokeWidth={activeTab === 'history' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">紀錄</span></button>
+            <button onClick={() => setActiveTab('input')} className={`flex flex-col items-center w-14 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}><LayoutDashboard size={20} strokeWidth={activeTab === 'input' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">試算</span></button>
+            <button onClick={() => setActiveTab('report')} className={`flex flex-col items-center w-14 ${activeTab === 'report' ? 'text-blue-600' : 'text-gray-400'}`}><PieChart size={20} strokeWidth={activeTab === 'report' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">分析</span></button>
+            <button onClick={() => setActiveTab('detail')} className={`flex flex-col items-center w-14 ${activeTab === 'detail' ? 'text-blue-600' : 'text-gray-400'}`}><List size={20} strokeWidth={activeTab === 'detail' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">明細</span></button>
+            {/* 更新底部按鈕：資金管理 */}
+            <button onClick={() => setActiveTab('assets')} className={`flex flex-col items-center w-14 ${activeTab === 'assets' ? 'text-blue-600' : 'text-gray-400'}`}><Wallet size={20} strokeWidth={activeTab === 'assets' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">資金</span></button>
+            <button onClick={() => setActiveTab('history')} className={`flex flex-col items-center w-14 ${activeTab === 'history' ? 'text-blue-600' : 'text-gray-400'}`}><History size={20} strokeWidth={activeTab === 'history' ? 2.5 : 2} /><span className="text-[10px] mt-1 font-medium">紀錄</span></button>
           </div>
 
         </div>
